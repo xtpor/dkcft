@@ -1,0 +1,237 @@
+#!/bin/sh
+
+export SCRIPT_ROOT=$( cd $(dirname $0); pwd -P )
+export DKCFT_ROOT="$HOME/.dkcft"
+
+function require_cmd() {
+    type $1 >/dev/null 2>&1 || { echo >&2 "This program require $1 but it's not installed.  Aborting."; exit 1;  }
+}
+
+require_cmd pv
+require_cmd python
+require_cmd wget
+require_cmd curl
+require_cmd docker
+require_cmd ssh
+
+if [ ! -f ~/.ssh/id_rsa.pub ]; then
+    echo >&2 "You do have a ssh key, please use ssh-keygen to create one."
+    echo >&2 "Aborting."
+fi
+
+if [ ! -d "$DKCFT_ROOT" ]; then
+    echo >&2 "Installed config in ~/.dkcft"
+    cp -r $SCRIPT_ROOT/default-config $DKCFT_ROOT
+fi
+
+function required_arg() {
+    if [ ! "$1" ]; then
+        echo "Error: parameter <$2> is missing"
+        exit -1;
+    fi
+}
+
+function download() {
+    required_arg "$1" "version"
+
+    FILE=minecraft_server.$1.jar
+    URL=s3.amazonaws.com/Minecraft.Download/versions/$1/$FILE
+
+    if [ ! -f $DKCFT_ROOT/cache/$FILE ]; then
+        wget -P $DKCFT_ROOT/cache $URL 
+    fi
+}
+
+function build() {
+    required_arg "$1" "version"
+
+    # if [ ! "$(docker images -q minecraft:$1 2> /dev/null)" = "" ]; then
+    #     echo "already have image minecraft:$1"
+    #     return 0
+    # fi
+
+    download "$1"
+
+    pushd $DKCFT_ROOT > /dev/null
+    mkdir tmp
+
+    cp $SCRIPT_ROOT/Dockerfile $SCRIPT_ROOT/startup.sh tmp/
+    cp -r $DKCFT_ROOT/template tmp/
+    cp cache/minecraft_server.$1.jar tmp/server.jar
+
+    docker build -t "minecraft:$1" tmp
+
+    rm -rf tmp
+    popd > /dev/null
+}
+
+function resolve_id() {
+    TOKEN=$(cat $DKCFT_ROOT/token)
+    required_arg "$1" "name"
+
+    curl -X GET  -H "Content-Type: application/json" \
+         -H "Authorization: Bearer $TOKEN" \
+         "https://api.digitalocean.com/v2/droplets" 2> /dev/null \
+    | python droplet-table.py \
+    | while read line; do
+        if [[ $line == $1* ]]; then
+            echo $line | cut -d ' ' -f2
+        fi
+    done
+}
+
+function resolve_ip() {
+    TOKEN=$(cat $DKCFT_ROOT/token)
+    required_arg "$1" "name"
+
+    RESULT="$(curl -X GET  -H "Content-Type: application/json" \
+         -H "Authorization: Bearer $TOKEN" \
+         "https://api.digitalocean.com/v2/droplets" 2> /dev/null \
+    | python droplet-table.py \
+    | while read line; do
+        if [[ $line == $1* ]]; then
+            echo $line | cut -d ' ' -f3
+        fi
+    done)"
+
+    if [ "$RESULT" ]; then
+        echo "core@$RESULT"
+    else
+        echo $1
+    fi
+}
+
+function fetch_password() {
+    required_arg "$1" "host"
+    ssh "$1" 'cat /home/core/minecraft/server.properties | grep "rcon.password" | cut -d "=" -f2 '
+}
+
+function droplet() {
+    TOKEN=$(cat $DKCFT_ROOT/token)
+    required_arg "$1" "subcommand"
+
+    case $1 in
+        "ls")
+            curl -X GET \
+                 -H "Content-Type: application/json" \
+                 -H "Authorization: Bearer $TOKEN" \
+                 "https://api.digitalocean.com/v2/droplets" 2> /dev/null \
+            | python format-list.py
+            ;;
+        "destory")
+            required_arg "$2" "name"
+            ID=$(resolve_id "$2")$
+
+            curl -X DELETE \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://api.digitalocean.com/v2/droplets/$ID" 2> /dev/null
+            ;;
+        "create")
+            required_arg "$2" "name"
+
+            NAME="$2"
+            SSHKEY=$(ssh-keygen -E md5 -lf ~/.ssh/id_rsa.pub | cut -d ' ' -f2 | cut -d : -f 2-)
+            REGION="sgp1"
+            SIZE=${$3:"512mb"}
+            IMAGE="coreos-stable"
+
+            curl -X POST \
+                 -H "Content-Type: application/json" \
+                 -H "Authorization: Bearer $TOKEN" \
+                 -d '{"name":"'$NAME'","region":"'$REGION'","size":"'$SIZE'","image":"'$IMAGE'","ssh_keys":["'$SSHKEY'"]}' \
+                 "https://api.digitalocean.com/v2/droplets"
+
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+}
+
+function world() {
+    required_arg "$1" "subcommand"
+
+    case $1 in
+        "save")
+            required_arg "$2" "host"
+            required_arg "$3" "world-name"
+            HOST=$(resolve_ip "$2")
+
+            ssh "$HOST" 'tar -zc --to-stdout minecraft' | pv > $DKCFT_ROOT/worlds/$3
+            ;;
+        "load")
+            required_arg "$2" "host"
+            required_arg "$3" "world-name"
+            HOST=$(resolve_ip "$2")
+
+            cat $DKCFT_ROOT/worlds/$3 | pv | ssh "$HOST" 'sudo tar -zxf -'
+            ;;
+        "ls")
+            ls $DKCFT_ROOT/worlds
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+}
+
+case $1 in
+    "build")
+        build "$2"
+        ;;
+    "set-token")
+        required_arg "$2" "token"
+        echo "$2" > $DKCFT_ROOT/token
+        ;;
+    "droplet")
+        droplet "${@:2}"
+        ;;
+    "world")
+        world "${@:2}"
+        ;;
+    "install")
+        required_arg "$2" "host"
+        required_arg "$3" "version"
+
+        HOST=$(resolve_ip "$2")
+
+        docker save "minecraft:$3" | bzip2 | pv | \
+            ssh "$HOST" 'bunzip2 | docker load'
+
+        ;;
+    "start")
+        required_arg "$2" "host"
+        required_arg "$3" "version"
+        HOST=$(resolve_ip "$2")
+
+        ssh "$HOST" "docker rm minecraft; \
+        docker run -d \
+            -p 25565:25565 -p 25575:25575 \
+            -v /home/core/minecraft:/minecraft/data \
+            --name minecraft \
+            minecraft:$3"
+
+        ;;
+    "stop")
+        required_arg "$2" "host"
+        HOST=$(resolve_ip "$2")
+        PASSWORD=$(fetch_password $HOST)
+
+        echo "stop" | python rcon.py $HOST $PASSWORD
+        ;;
+    "console")
+        required_arg "$2" "host"
+        HOST=$(resolve_ip "$2")
+        PASSWORD=$(fetch_password $HOST)
+
+        python rcon.py $HOST $PASSWORD
+        ;;
+    "resolve-ip")
+        required_arg "$2" "host"
+        resolve_ip "$2"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
