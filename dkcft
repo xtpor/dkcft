@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 export SCRIPT_ROOT=$( cd $(dirname $0); pwd -P )
 export DKCFT_ROOT="$HOME/.dkcft"
@@ -133,7 +133,7 @@ function droplet() {
             NAME="$2"
             SSHKEY=$(ssh-keygen -E md5 -lf ~/.ssh/id_rsa.pub | cut -d ' ' -f2 | cut -d : -f 2-)
             REGION="sgp1"
-            SIZE=${$3:"512mb"}
+            SIZE=${3:-"512mb"}
             IMAGE="coreos-stable"
 
             curl -X POST \
